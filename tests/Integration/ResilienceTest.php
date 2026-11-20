@@ -27,9 +27,9 @@ class ResilienceTest extends TestCase
         parent::tearDown();
     }
 
-    private function client(array $parameters = []): Client
+    private function client(array $parameters = [], $connector = null): Client
     {
-        return $this->clients[] = self::clientFromEnv($parameters, $this->getLoop());
+        return $this->clients[] = self::clientFromEnv($parameters, $this->getLoop(), $connector);
     }
 
     private function pause(float $seconds)
@@ -120,7 +120,14 @@ class ResilienceTest extends TestCase
         $this->pause(0.3);
 
         $this->assertSame(0, $client->getReservedConnectionCount());
-        $this->assertSame('I', $client->getIdleConnection()->getBackendTransactionStatus(), 'the transaction BEGIN opened was rolled back');
+
+        // The cancel sent for BEGIN was not what ended it, so its connection may have been replaced: either way no transaction is left
+        // open, which a new transaction on the only connection shows (it starts from idle).
+        $next = $this->collect($client->transaction());
+        $this->settle($next);
+        $this->assertCount(1, $next->values, 'a transaction can still be opened on the only connection');
+        $next->values[0]->rollback()->subscribe(new CallbackObserver());
+        $this->pause(0.1);
     }
 
     public function testACancelledCommitDoesNotLeakTheReservedConnection()
@@ -189,6 +196,128 @@ class ResilienceTest extends TestCase
 
         $this->assertSame([['one' => '1']], $next->values);
         $this->assertLessThan(3.0, microtime(true) - $started);
+    }
+
+    public function testACancelThatArrivesAsItsStatementEndsNeverHitsTheNextStatementOfTheConnection()
+    {
+        $client = $this->client(['max_connections' => 1]);
+        $this->warm($client);
+        $timeouts = 0;
+
+        for ($i = 0; $i < 150; $i++) {
+            $connection = $client->getIdleConnection();
+            $this->assertNotNull($connection, 'a connection is always available again (dropped ones are replaced)');
+
+            // The statement ends about when it is disposed of, so the cancel races its end.
+            $running = $connection->executeStatement('SELECT pg_sleep(0.0505)')->subscribe(new CallbackObserver());
+            $this->pause(0.05);
+            $running->dispose();
+            $timeouts++;
+
+            $next = $this->collect($client->executeStatement('SELECT 1 AS one FROM pg_sleep(0.02)'));
+            $this->settle($next, 5.0);
+
+            $this->assertNull($next->error, 'statement ' . $i . ' failed: ' . ($next->error ? $next->error->getMessage() : ''));
+            $this->assertSame([['one' => '1']], $next->values);
+        }
+
+        $this->assertSame(150, $timeouts);
+    }
+
+    public function testAConnectionWhoseCancelDidNotEndItsStatementIsDroppedNotReused()
+    {
+        $silent    = new \React\Socket\TcpServer('127.0.0.1:0', $this->getLoop());
+        $connector = $this->connectorWithSilentCancel($silent);
+
+        try {
+            $client = $this->client(['max_connections' => 1], $connector);
+            $this->warm($client);
+            $connection = $client->getIdleConnection();
+            $closed     = false;
+            $connection->on('reconnect', function () use (&$closed) {
+                $closed = true;
+            });
+
+            // The cancel never reaches the server and the statement ends by itself: nothing consumed the cancel, which may still be on its way
+            // to whatever runs on this backend next, so the connection is dropped instead of reused.
+            $running = $connection->executeStatement('SELECT pg_sleep(0.3)')->subscribe(new CallbackObserver());
+            $this->pause(0.1);
+            $connector->silentNext = true;
+            $running->dispose();
+            $this->pause(0.6);
+
+            $this->assertTrue($closed, 'the connection started a new session');
+
+            $next = $this->collect($client->executeStatement('SELECT 1 AS one'));
+            $this->settle($next, 5.0);
+            $this->assertSame([['one' => '1']], $next->values, 'the pool serves the next statement on a new connection');
+        } finally {
+            $silent->close();
+        }
+    }
+
+    public function testACancelNoOneAnswersDropsTheConnectionInsteadOfHoldingItForEver()
+    {
+        $silent    = new \React\Socket\TcpServer('127.0.0.1:0', $this->getLoop());
+        $connector = $this->connectorWithSilentCancel($silent);
+
+        try {
+            $client = $this->client(['max_connections' => 1, 'cancel_timeout' => 0.3], $connector);
+            $this->warm($client);
+            $connection = $client->getIdleConnection();
+            $closed     = false;
+            $connection->on('reconnect', function () use (&$closed) {
+                $closed = true;
+            });
+
+            $running = $connection->executeStatement('SELECT pg_sleep(30)')->subscribe(new CallbackObserver());
+            $this->pause(0.2);
+            $connector->silentNext = true;
+            $running->dispose();
+            $this->pause(0.8);
+
+            $this->assertTrue($closed, 'a cancel nothing answered did not leave the connection waiting for a 30 second statement (it started a new session)');
+
+            $next = $this->collect($client->executeStatement('SELECT 1 AS one'));
+            $this->settle($next, 5.0);
+            $this->assertSame([['one' => '1']], $next->values, 'the pool serves the next statement on a new connection');
+        } finally {
+            $silent->close();
+        }
+    }
+
+    /**
+     * A connector whose next connection (set `silentNext`) goes to a server that accepts and never answers: the cancel request of a
+     * statement then never reaches PostgreSQL.
+     */
+    private function connectorWithSilentCancel(\React\Socket\TcpServer $silent)
+    {
+        $loop = $this->getLoop();
+
+        return new class($loop, str_replace('tcp://', '', $silent->getAddress())) implements \React\Socket\ConnectorInterface {
+            public $silentNext = false;
+            private $real;
+            private $tcp;
+            private $address;
+
+            public function __construct($loop, $address)
+            {
+                $this->real    = new \WyriHaximus\React\Socket\Connector($loop, []);
+                $this->tcp     = new \React\Socket\TcpConnector($loop);
+                $this->address = $address;
+            }
+
+            public function connect($uri)
+            {
+                if ($this->silentNext) {
+                    $this->silentNext = false;
+
+                    return $this->tcp->connect($this->address);
+                }
+
+                return $this->real->connect($uri);
+            }
+        };
     }
 
     public function testAQueryInFlightFailsWhenTheSocketGoesAway()

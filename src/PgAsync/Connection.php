@@ -136,10 +136,22 @@ class Connection extends EventEmitter
     private $notificationSubject;
 
     /** @var bool */
-    private $cancelPending;
-
-    /** @var bool */
     private $cancelRequested;
+
+    /** @var bool a cancel request was sent for the statement now running and that statement has not ended yet */
+    private $cancelIssued = false;
+
+    /** @var bool the statement the cancel was sent for failed with `query_canceled` (57014): the signal was consumed by it */
+    private $cancelAcknowledged = false;
+
+    /** @var int */
+    private $cancelSequence = 0;
+
+    /** @var float seconds the statement a cancel was sent for may take to end before the connection is dropped */
+    private $cancelTimeout = 5.0;
+
+    /** @var \React\EventLoop\TimerInterface|null */
+    private $cancelTimer;
 
     /** @var ScramSha256 */
     private $scramSha256;
@@ -199,6 +211,11 @@ class Connection extends EventEmitter
             unset($parameters['tls_connector_flags']);
         }
 
+        if (isset($parameters['cancel_timeout'])) {
+            $this->cancelTimeout = (float) $parameters['cancel_timeout'];
+            unset($parameters['cancel_timeout']);
+        }
+
         if (isset($parameters['auto_disconnect'])) {
             $this->auto_disconnect = $parameters['auto_disconnect'];
             unset($parameters['auto_disconnect']);
@@ -227,7 +244,6 @@ class Connection extends EventEmitter
         // plaint text connection with all TLS flags already set and ready to use for all the other modes.
         $this->uri                 = 'opportunistic+tls://' . $parameters['host'] . ':' . $parameters['port'];
         $this->notificationSubject = new Subject();
-        $this->cancelPending       = false;
         $this->cancelRequested     = false;
 
         $this->parameters          = $parameters;
@@ -303,7 +319,8 @@ class Connection extends EventEmitter
         return array_reduce(
             $this->commandQueue,
             function ($a, CommandInterface $command) {
-                if ($command instanceof Query || $command instanceof Sync) {
+                // A command whose subscriber went away is only waiting to be skipped: it is no work for the connection.
+                if (($command instanceof Query || $command instanceof Sync) && $command->isActive()) {
                     $a++;
                 }
                 return $a;
@@ -439,6 +456,7 @@ class Connection extends EventEmitter
     public function onClose()
     {
         $this->connStatus = static::CONNECTION_CLOSED;
+        $this->clearCancel();
 
         // The command on the wire has been taken off the queue, so failing the queue does not reach it: without this a
         // request waiting for its answer waits for ever when the socket goes away.
@@ -634,6 +652,9 @@ class Connection extends EventEmitter
     private function handleErrorResponse(ErrorResponse $message)
     {
         $this->lastError = $message;
+        if ($this->cancelIssued && $message->getSqlState() === '57014') {
+            $this->cancelAcknowledged = true;
+        }
         if ($message->getSeverity() === 'FATAL') {
             $this->connStatus = $this::CONNECTION_BAD;
             // notify any waiting commands
@@ -683,8 +704,93 @@ class Connection extends EventEmitter
         $this->currentCommand = null;
         $this->backendTransactionStatus = $message->getBackendTransactionStatus();
         $this->resolveReadyForQueryWaiters($this->backendTransactionStatus);
+
+        if ($this->settleCancel()) {
+            return;
+        }
+
         $this->emit('ready');
         $this->processQueue();
+    }
+
+    /**
+     * The statement a cancel request was sent for has ended. When it failed with `query_canceled` the signal was consumed by it and the
+     * connection is safe. Otherwise (it finished first) the cancel may still be on its way, to hit whatever runs next on this backend
+     * (the end of a connection is no proof it arrived: a pooler in front answers the request itself): the connection is dropped, so
+     * nothing is ever sent to a backend that can still be signalled.
+     *
+     * @return bool true when the connection was dropped
+     */
+    private function settleCancel(): bool
+    {
+        if (!$this->cancelIssued) {
+            return false;
+        }
+
+        $acknowledged = $this->cancelAcknowledged;
+        $this->clearCancel();
+
+        if ($acknowledged) {
+            return false;
+        }
+
+        $this->dropAfterCancel();
+
+        return true;
+    }
+
+    /**
+     * Ends the backend session a cancel request may still reach. The connection itself stays in the pool: outside a transaction it
+     * starts a new session and the commands already queued on it (the pool pipelines queries onto busy connections, and hands a
+     * connection out a turn of the loop before it is used) are carried over. Inside a transaction the queued commands belong to
+     * the transaction that is gone with the session, so the connection is closed and they fail.
+     */
+    private function dropAfterCancel()
+    {
+        if ($this->backendTransactionStatus === 'I' && $this->stream !== null && $this->connStatus !== static::CONNECTION_CLOSED) {
+            $this->reconnect();
+
+            return;
+        }
+
+        $this->kill();
+    }
+
+    /**
+     * Replaces the socket (and so the backend) with a new one and keeps the queued commands, which are sent once it is ready.
+     */
+    private function reconnect()
+    {
+        $this->clearCancel();
+
+        $stream       = $this->stream;
+        $this->stream = null;
+        $stream->removeListener('close', [$this, 'onClose']);
+        $stream->removeListener('data', [$this, 'onData']);
+        $stream->close();
+
+        $this->currentMessage           = null;
+        $this->currentCommand           = null;
+        $this->queryState               = static::STATE_BUSY;
+        $this->queryType                = static::QUERY_SIMPLE;
+        $this->connStatus               = static::CONNECTION_NEEDED;
+        $this->backendKeyData           = null;
+        $this->backendTransactionStatus = 'UNKNOWN';
+        $this->scramSha256              = new ScramSha256($this->parameters['user'], $this->password ?: '');
+
+        $this->start();
+        $this->emit('reconnect');
+    }
+
+    private function clearCancel()
+    {
+        $this->cancelIssued       = false;
+        $this->cancelAcknowledged = false;
+
+        if ($this->cancelTimer !== null) {
+            $this->loop->cancelTimer($this->cancelTimer);
+            $this->cancelTimer = null;
+        }
     }
 
     private function handleRowDescription(RowDescription $message)
@@ -709,11 +815,6 @@ class Connection extends EventEmitter
 
     public function processQueue()
     {
-        if ($this->cancelPending) {
-            $this->debug("Not processing queue because there is a cancellation pending.");
-            return;
-        }
-
         if (count($this->commandQueue) === 0 && $this->queryState === static::STATE_READY && $this->auto_disconnect) {
             $this->commandQueue[] = new Terminate();
         }
@@ -996,18 +1097,25 @@ class Connection extends EventEmitter
             return;
         }
         if ($this->currentCommand !== null && $this->backendKeyData !== null) {
-            $this->cancelPending = true;
-            $this->socket->connect($this->uri)->then(function (DuplexStreamInterface $conn) {
-                $cancelRequest = new CancelRequest($this->backendKeyData->getPid(), $this->backendKeyData->getKey());
-                $conn->on('close', function () {
-                    $this->cancelPending = false;
-                    $this->processQueue();
-                });
-                $conn->end($cancelRequest->encodedMessage());
-            }, function (\Throwable $e) {
-                $this->cancelPending = false;
-                $this->processQueue();
+            $this->cancelIssued       = true;
+            $this->cancelAcknowledged = false;
+            // A backend that never ends the statement (it is gone, or the cancel was lost) must not hold the connection for ever.
+            $this->cancelTimer = $this->loop->addTimer($this->cancelTimeout, function () {
+                $this->cancelTimer = null;
+                $this->dropAfterCancel();
+            });
+
+            $id      = ++$this->cancelSequence;
+            $request = (new CancelRequest($this->backendKeyData->getPid(), $this->backendKeyData->getKey()))->encodedMessage();
+
+            $this->socket->connect($this->uri)->then(function (DuplexStreamInterface $conn) use ($request) {
+                $conn->end($request);
+            }, function (\Throwable $e) use ($id) {
                 $this->debug("Error connecting for cancellation... " . $e->getMessage() . "\n");
+                // The statement cannot be stopped and cannot be told apart from one that will end by itself: do not wait for it.
+                if ($this->cancelIssued && $this->cancelSequence === $id) {
+                    $this->dropAfterCancel();
+                }
             });
         }
     }

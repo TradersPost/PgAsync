@@ -1,3 +1,10 @@
+# 2.6.0
+
+### Bug Fixes
+
+- A cancel request can no longer hit a later, unrelated statement of the same connection. The cancel is sent on its own socket and closing that socket says nothing about the backend having handled it (a pooler in front answers it itself), so a statement that ended just before the signal arrived left it to cancel whatever ran next, aborting a transaction or failing an innocent query. The connection is now reused only when the statement the cancel was sent for ended with `query_canceled` (57014), which proves the signal was consumed. When it ended any other way the backend may still be signalled: outside a transaction the connection starts a new session (queued commands are carried over, a `reconnect` event is emitted); inside one it is closed. A cancel that is never answered (`cancel_timeout`, seconds, default 5) or cannot connect does the same instead of holding the connection for ever.
+- `Connection::getBacklogLength()` no longer counts commands whose subscriber went away, so a transaction waiting for a connection is not left waiting when only skipped commands are queued.
+
 # 2.5.0
 
 ### Bug Fixes
