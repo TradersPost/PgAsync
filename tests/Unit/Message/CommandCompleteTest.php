@@ -26,6 +26,7 @@ class CommandCompleteTest extends TestCase
             'update' => ['UPDATE 2', 2, 0],
             'delete' => ['DELETE 0', 0, 0],
             'select' => ['SELECT 5', 5, 0],
+            'merge' => ['MERGE 4', 4, 0],
             'a command without a count' => ['CREATE TABLE', 0, 0],
         ];
     }

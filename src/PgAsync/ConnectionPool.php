@@ -44,34 +44,90 @@ class ConnectionPool
     /** @var int */
     private $maxConnections;
 
+    /** @var float|null seconds a caller may wait for a connection; null waits for ever */
+    private $acquireTimeout;
+
     public function __construct(
         array $parameters,
         LoopInterface $loop,
         ?ConnectorInterface $connector = null,
         bool $autoDisconnect = false,
-        int $maxConnections = 5
+        int $maxConnections = 5,
+        ?float $acquireTimeout = null
     ) {
         $this->parameters     = $parameters;
         $this->loop           = $loop;
         $this->connector      = $connector;
         $this->autoDisconnect = $autoDisconnect;
         $this->maxConnections = $maxConnections;
+        $this->acquireTimeout = $acquireTimeout !== null && $acquireTimeout > 0 ? $acquireTimeout : null;
+    }
+
+    /**
+     * Connections a transaction holds (or is still opening). A pool that loses them one by one after aborted requests
+     * shrinks until nothing can run.
+     */
+    public function getReservedConnectionCount(): int
+    {
+        return count($this->reservedConnections) + count($this->pendingReservationConnections);
+    }
+
+    public function getWaiterCount(): int
+    {
+        return count($this->connectionWaiters);
     }
 
     public function acquire(bool $forTransaction): Observable
     {
         $connection = $this->tryAcquire($forTransaction);
         if ($connection !== null) {
-            return Observable::of($connection);
+            // The connection is reserved now, but the subscriber gets it on the loop's next turn: if it goes away
+            // before then, nothing would ever hand the connection back.
+            $delivered = false;
+
+            return Observable::of($connection)
+                ->do(function () use (&$delivered) {
+                    $delivered = true;
+                })
+                ->finally(function () use (&$delivered, $connection) {
+                    if (!$delivered) {
+                        $delivered = true;
+                        $this->release($connection);
+                    }
+                });
         }
 
         return new AnonymousObservable(function (ObserverInterface $observer) use ($forTransaction) {
             $key      = 'waiter' . ++$this->waiterSequence;
             $disposed = false;
+            $timer    = null;
+
+            if ($this->acquireTimeout !== null) {
+                // Fail loudly rather than wait for ever for a connection nothing will give back (every connection held by
+                // a transaction whose owner is itself waiting for one).
+                $timer = $this->loop->addTimer($this->acquireTimeout, function () use ($key, $observer, &$disposed, &$timer) {
+                    $timer = null;
+                    if ($disposed || !isset($this->connectionWaiters[$key])) {
+                        return;
+                    }
+                    unset($this->connectionWaiters[$key]);
+                    $disposed = true;
+                    $observer->onError(new \RuntimeException(sprintf(
+                        'Timed out after %s seconds waiting for a database connection (%d connections, %d held by transactions).',
+                        $this->acquireTimeout,
+                        count($this->connections),
+                        $this->getReservedConnectionCount()
+                    )));
+                });
+            }
 
             $this->connectionWaiters[$key] = [
                 'forTransaction' => $forTransaction,
-                'resolve'        => function ($connection) use ($observer, &$disposed) {
+                'resolve'        => function ($connection) use ($observer, &$disposed, &$timer) {
+                    if ($timer !== null) {
+                        $this->loop->cancelTimer($timer);
+                        $timer = null;
+                    }
                     if ($disposed) {
                         // The subscriber went away while it waited: hand the connection straight back.
                         $this->release($connection);
@@ -82,7 +138,11 @@ class ConnectionPool
                     $observer->onNext($connection);
                     $observer->onCompleted();
                 },
-                'reject'         => function ($e) use ($observer, &$disposed) {
+                'reject'         => function ($e) use ($observer, &$disposed, &$timer) {
+                    if ($timer !== null) {
+                        $this->loop->cancelTimer($timer);
+                        $timer = null;
+                    }
                     if ($disposed) {
                         return;
                     }
@@ -93,8 +153,12 @@ class ConnectionPool
 
             $this->processConnectionWaiters();
 
-            return new CallbackDisposable(function () use ($key, &$disposed) {
+            return new CallbackDisposable(function () use ($key, &$disposed, &$timer) {
                 $disposed = true;
+                if ($timer !== null) {
+                    $this->loop->cancelTimer($timer);
+                    $timer = null;
+                }
                 unset($this->connectionWaiters[$key]);
             });
         });
@@ -210,6 +274,12 @@ class ConnectionPool
             return $this->createConnection();
         }
 
+        // A transaction needs a connection with nothing queued on it. While one waits, queries that pipeline onto the busy
+        // connections would keep them busy for as long as queries keep coming: they wait their turn instead.
+        if ($this->hasTransactionWaiter()) {
+            return null;
+        }
+
         $leastBusy = null;
 
         foreach ($this->connections as $connection) {
@@ -240,6 +310,17 @@ class ConnectionPool
         }
 
         return null;
+    }
+
+    private function hasTransactionWaiter(): bool
+    {
+        foreach ($this->connectionWaiters as $waiter) {
+            if ($waiter['forTransaction']) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function markConnectionReserved(Connection $connection)

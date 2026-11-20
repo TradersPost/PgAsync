@@ -25,8 +25,18 @@ class ErrorException extends \Exception
         return $this->errorResponse;
     }
 
+    /**
+     * The SQLSTATE code of the error (for example 23505 for a unique violation), or null when the server sent none.
+     *
+     * @return string|null
+     */
+    public function getSqlState()
+    {
+        return $this->errorResponse->getSqlState();
+    }
+
     public function getExtraInfo(): array
     {
-        return $this->extraInfo;
+        return $this->extraInfo ?? [];
     }
 }

@@ -3,6 +3,7 @@
 namespace PgAsync;
 
 use Rx\Observable;
+use Rx\Observer\CallbackObserver;
 
 final class Transaction
 {
@@ -59,6 +60,31 @@ final class Transaction
         return $this->connection->executeStatement($queryString, $parameters);
     }
 
+    /**
+     * What the server last said about the transaction: 'T' while it is open, 'E' after a statement in it has failed (it can
+     * then only be rolled back, and COMMIT rolls it back silently), 'I' once it has ended.
+     */
+    public function getBackendTransactionStatus(): string
+    {
+        return $this->connection->getBackendTransactionStatus();
+    }
+
+    /**
+     * Emits the backend transaction status once the connection has answered everything sent to it. Right after a statement
+     * failed the error arrives before the ReadyForQuery that carries the new status, so
+     * {@see Transaction::getBackendTransactionStatus()} may still say 'T' for a moment.
+     *
+     * @return Observable<string>
+     */
+    public function whenReady(): Observable
+    {
+        if ($this->finished) {
+            return $this->inactiveError();
+        }
+
+        return $this->connection->whenReadyForQuery();
+    }
+
     public function commit(): Observable
     {
         if ($this->finishing) {
@@ -100,7 +126,32 @@ final class Transaction
             // COMMIT/ROLLBACK itself failed (a deferred constraint, a lost connection): do not keep the connection
             // reserved forever.
             return $this->abandon()->concat(Observable::error($e));
+        })->finally(function () {
+            // The subscriber went away before the server answered (a cancelled request): the connection is still
+            // reserved, and the server may still have the transaction open.
+            if (!$this->finished) {
+                $this->abandon()->subscribe(new CallbackObserver(null, function () {
+                }, function () {
+                }));
+            }
         });
+    }
+
+    /**
+     * Drops the connection of a transaction whose backend no longer answers (a statement timed out and the server is
+     * unreachable): ROLLBACK cannot be sent to it, so the connection is closed and the pool forgets it. Does nothing once
+     * the transaction has ended.
+     */
+    public function discard()
+    {
+        if ($this->finished) {
+            return;
+        }
+
+        $this->finishing = true;
+        $this->finished  = true;
+        $this->connection->kill();
+        ($this->release)();
     }
 
     /**

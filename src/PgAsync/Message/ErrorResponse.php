@@ -76,6 +76,18 @@ class ErrorResponse implements ParserInterface
         return count($message) > 0 ? array_pop($message) : null;
     }
 
+    /**
+     * The SQLSTATE code (for example 23505 for a unique violation), or null when the server sent none.
+     *
+     * @return string|null
+     */
+    public function getSqlState()
+    {
+        $code = $this->getErrorMessagesOfType('C');
+
+        return count($code) > 0 ? array_pop($code) : null;
+    }
+
     private function getErrorMessagesOfType($type):array
     {
         return array_map(function ($x) {

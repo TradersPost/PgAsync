@@ -6,6 +6,7 @@ use PgAsync\Message\NotificationResponse;
 use React\EventLoop\LoopInterface;
 use React\Socket\ConnectorInterface;
 use Rx\Observable;
+use Rx\Observer\CallbackObserver;
 use Rx\Subject\Subject;
 
 class Client
@@ -28,6 +29,16 @@ class Client
 
         $autoDisconnect = false;
         $maxConnections = 5;
+        // Seconds a query or transaction may wait for a free connection before it fails; `acquire_timeout` => 0 waits for ever.
+        $acquireTimeout = 30.0;
+
+        if (isset($parameters['acquire_timeout'])) {
+            if (!is_int($parameters['acquire_timeout']) && !is_float($parameters['acquire_timeout'])) {
+                throw new \InvalidArgumentException('`acquire_timeout` must be a number of seconds.');
+            }
+            $acquireTimeout = (float) $parameters['acquire_timeout'];
+        }
+        unset($parameters['acquire_timeout']);
 
         if (isset($parameters['auto_disconnect'])) {
             $autoDisconnect = $parameters['auto_disconnect'];
@@ -49,7 +60,8 @@ class Client
             $this->loop,
             $connector,
             $autoDisconnect,
-            $maxConnections
+            $maxConnections,
+            $acquireTimeout
         );
     }
 
@@ -78,21 +90,66 @@ class Client
     {
         return Observable::defer(function () {
             return $this->connectionPool->acquire(true)->flatMap(function (Connection $connection) {
-                return $connection->queryUntilReady('BEGIN')->flatMap(function ($status) use ($connection) {
-                    if ($status !== 'T') {
-                        $this->connectionPool->release($connection);
+                // Until the Transaction exists nobody but this chain can give the connection back.
+                $handedOver = false;
 
+                return $connection->queryUntilReady('BEGIN')->flatMap(function ($status) use ($connection, &$handedOver) {
+                    if ($handedOver) {
+                        // The subscriber went away while BEGIN ran and the connection is already being given back.
+                        return Observable::empty();
+                    }
+
+                    if ($status !== 'T') {
                         return Observable::error(new \RuntimeException('Expected transaction status T after BEGIN'));
                     }
 
+                    $handedOver = true;
+
                     return Observable::of($this->createTransaction($connection));
-                })->catch(function (\Throwable $e) use ($connection) {
-                    $this->connectionPool->release($connection);
+                })->catch(function (\Throwable $e) use ($connection, &$handedOver) {
+                    if (!$handedOver) {
+                        $handedOver = true;
+                        $this->abandonReservation($connection);
+                    }
 
                     return Observable::error($e);
+                })->finally(function () use ($connection, &$handedOver) {
+                    // The subscriber went away while BEGIN was on its way: the connection is still reserved.
+                    if (!$handedOver) {
+                        $handedOver = true;
+                        $this->abandonReservation($connection);
+                    }
                 });
             });
         });
+    }
+
+    /**
+     * Gives back a reserved connection nobody holds a Transaction for. BEGIN may still be on its way, so the connection is
+     * only reused once the server has answered and, if that left a transaction open, rolled back.
+     */
+    private function abandonReservation(Connection $connection)
+    {
+        $release = function () use ($connection) {
+            $this->connectionPool->release($connection);
+        };
+
+        $connection->whenReadyForQuery()
+            ->flatMap(function ($status) use ($connection) {
+                if ($status === 'I') {
+                    return Observable::empty();
+                }
+
+                return $connection->queryUntilReady('ROLLBACK')->filter(function () {
+                    return false;
+                });
+            })
+            ->subscribe(new CallbackObserver(null, $release, $release));
+    }
+
+    public function getReservedConnectionCount(): int
+    {
+        return $this->connectionPool->getReservedConnectionCount();
     }
 
     private function createTransaction(Connection $connection): Transaction

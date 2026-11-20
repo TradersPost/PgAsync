@@ -155,6 +155,9 @@ class Connection extends EventEmitter
     /** @var array<int, array{resolve: callable, reject: callable}> */
     private $readyForQueryWaiters = [];
 
+    /** @var bool true while received bytes are being processed: a cancel then waits until they are all read */
+    private $handlingData = false;
+
     /** @var  bool */
     private $auto_disconnect = false;
     private $tls = self::TLS_MODE_PREFER;
@@ -184,7 +187,7 @@ class Connection extends EventEmitter
         }
 
         if (array_key_exists('tls', $parameters)) {
-            if (!in_array($this->tls, self::TLS_MODE_LIST_FULL)) {
+            if (!in_array($parameters['tls'], self::TLS_MODE_LIST_FULL, true)) {
                 throw new \InvalidArgumentException('TLS mode must be one off "' . implode(', ', self::TLS_MODE_LIST_FULL) . ' but got "' . $parameters['tls'] . '" instead');
             }
             $this->tls = $parameters['tls'];
@@ -212,9 +215,11 @@ class Connection extends EventEmitter
         $this->connStatus          = static::CONNECTION_NEEDED;
         $this->socket              = $connector ?: new Connector($loop, [
             'tls' => [
-                'verify_peer'       => $this->tls === self::TLS_MODE_VERIFY_FULL,
+                // As libpq: verify-ca checks the certificate chain, verify-full the host name as well; every other mode
+                // encrypts without verifying who is on the other end.
+                'verify_peer'       => $this->tls === self::TLS_MODE_VERIFY_CA || $this->tls === self::TLS_MODE_VERIFY_FULL,
                 'verify_peer_name'  => $this->tls === self::TLS_MODE_VERIFY_FULL,
-                'allow_self_signed' => $this->tls !== self::TLS_MODE_VERIFY_FULL,
+                'allow_self_signed' => $this->tls !== self::TLS_MODE_VERIFY_CA && $this->tls !== self::TLS_MODE_VERIFY_FULL,
             ] + $this->tlsConnectorFlags,
         ]);
         // We always url `opportunistic+tls` as scheme because the logic required for using `tcp` on TLS `disable`
@@ -316,6 +321,10 @@ class Connection extends EventEmitter
      */
     public function whenReadyForQuery(): Observable
     {
+        if ($this->connStatus === static::CONNECTION_CLOSED) {
+            return Observable::error(new \Exception('Connection closed'));
+        }
+
         if ($this->queryState === static::STATE_READY) {
             return Observable::of($this->backendTransactionStatus);
         }
@@ -370,8 +379,13 @@ class Connection extends EventEmitter
 
     public function onData($data)
     {
-        while (strlen($data) > 0) {
-            $data = $this->processData($data);
+        $this->handlingData = true;
+        try {
+            while (strlen($data) > 0) {
+                $data = $this->processData($data);
+            }
+        } finally {
+            $this->handlingData = false;
         }
 
         // We should only cancel if we have drained the input buffer (as much as we can see)
@@ -425,8 +439,20 @@ class Connection extends EventEmitter
     public function onClose()
     {
         $this->connStatus = static::CONNECTION_CLOSED;
-        if ($this->queryState !== static::STATE_READY) {
-            $this->failAllCommandsWith(new \Exception('Connection closed before ready'));
+
+        // The command on the wire has been taken off the queue, so failing the queue does not reach it: without this a
+        // request waiting for its answer waits for ever when the socket goes away.
+        $inFlight             = $this->currentCommand;
+        $this->currentCommand = null;
+
+        if ($inFlight !== null || $this->queryState !== static::STATE_READY || count($this->commandQueue) > 0 || count($this->readyForQueryWaiters) > 0) {
+            $error = new \Exception('Connection closed before ready');
+
+            if ($inFlight !== null && $inFlight->isActive()) {
+                $inFlight->error($error);
+            }
+
+            $this->failAllCommandsWith($error);
         }
         $this->emit('close');
     }
@@ -568,6 +594,12 @@ class Connection extends EventEmitter
     {
         $this->lastRowsAffected = $message->getRows();
 
+        $this->completeCurrentCommand();
+        $this->debug('Command complete.');
+    }
+
+    private function completeCurrentCommand()
+    {
         if ($this->currentCommand instanceof CommandInterface) {
             $command = $this->currentCommand;
             $this->currentCommand = null;
@@ -578,7 +610,6 @@ class Connection extends EventEmitter
             // had a chance to start canceling - then never mind
             $this->cancelRequested = false;
         }
-        $this->debug('Command complete.');
     }
 
     private function handleCopyInResponse(CopyInResponse $message)
@@ -589,8 +620,15 @@ class Connection extends EventEmitter
     {
     }
 
+    /**
+     * The statement was empty (an empty string, only a comment, a lone semicolon): the server sends no CommandComplete,
+     * so the command finishes here, with no rows.
+     */
     private function handleEmptyQueryResponse(EmptyQueryResponse $message)
     {
+        $this->lastRowsAffected = 0;
+
+        $this->completeCurrentCommand();
     }
 
     private function handleErrorResponse(ErrorResponse $message)
@@ -637,6 +675,9 @@ class Connection extends EventEmitter
 
     private function handleReadyForQuery(ReadyForQuery $message)
     {
+        // A command the server finished without a CommandComplete must not be dropped unanswered.
+        $this->completeCurrentCommand();
+
         $this->connStatus     = $this::CONNECTION_OK;
         $this->queryState     = $this::STATE_READY;
         $this->currentCommand = null;
@@ -678,6 +719,12 @@ class Connection extends EventEmitter
         }
 
         if (count($this->commandQueue) === 0) {
+            return;
+        }
+
+        if ($this->connStatus === $this::CONNECTION_CLOSED) {
+            // Nothing can be written to a closed stream, and nothing would ever answer.
+            $this->failAllCommandsWith(new \Exception('Connection closed'));
             return;
         }
 
@@ -732,6 +779,10 @@ class Connection extends EventEmitter
                     $observer->onError(new \Exception('Connection failed'));
                     return new EmptyDisposable();
                 }
+                if ($this->connStatus === $this::CONNECTION_CLOSED) {
+                    $observer->onError(new \Exception('Connection closed'));
+                    return new EmptyDisposable();
+                }
 
                 $q = new Query($query, $observer);
                 $this->commandQueue[] = $q;
@@ -745,7 +796,7 @@ class Connection extends EventEmitter
                     $this->on('error', $listener);
                     return new CallbackDisposable(function () use ($q, $listener) {
                         if ($this->currentCommand === $q && $q->isActive()) {
-                            $this->cancelRequested = true;
+                            $this->requestCancel();
                         }
                         $this->removeListener('error', $listener);
                         $q->cancel();
@@ -754,7 +805,7 @@ class Connection extends EventEmitter
 
                 return new CallbackDisposable(function () use ($q) {
                     if ($this->currentCommand === $q && $q->isActive()) {
-                        $this->cancelRequested = true;
+                        $this->requestCancel();
                     }
                     $q->cancel();
                 });
@@ -813,6 +864,10 @@ class Connection extends EventEmitter
                     $observer->onError(new \Exception('Connetion failed'));
                     return new EmptyDisposable();
                 }
+                if ($this->connStatus === $this::CONNECTION_CLOSED) {
+                    $observer->onError(new \Exception('Connection closed'));
+                    return new EmptyDisposable();
+                }
 
                 $name = 'somestatement';
 
@@ -846,12 +901,13 @@ class Connection extends EventEmitter
                     };
                     $this->on('error', $listener);
                     return new CallbackDisposable(function () use ($sync, $commandGroup, $listener) {
+                        // Whichever way the subscription ends, the listener must go: it holds the observer.
+                        $this->removeListener('error', $listener);
                         if ($this->currentCommand === $sync && $sync->isActive()) {
-                            $this->cancelRequested = true;
+                            $this->requestCancel();
                             $sync->cancel();
                             return;
                         }
-                        $this->removeListener('error', $listener);
                         foreach ($commandGroup as $command) {
                             $command->cancel();
                         }
@@ -860,7 +916,7 @@ class Connection extends EventEmitter
 
                 return new CallbackDisposable(function () use ($sync, $commandGroup) {
                     if ($this->currentCommand === $sync && $sync->isActive()) {
-                        $this->cancelRequested = true;
+                        $this->requestCancel();
                         $sync->cancel();
 
                         // no point in canceling the other commands because they are out the door
@@ -901,6 +957,37 @@ class Connection extends EventEmitter
         $this->processQueue();
     }
 
+    /**
+     * Drops the connection at once, without the Terminate message: for a backend that has stopped answering. Every command
+     * that is waiting fails, and the pool forgets the connection.
+     */
+    public function kill()
+    {
+        if ($this->stream !== null && $this->connStatus !== static::CONNECTION_CLOSED) {
+            $this->stream->close();
+
+            return;
+        }
+
+        if ($this->connStatus !== static::CONNECTION_CLOSED) {
+            $this->onClose();
+        }
+    }
+
+    /**
+     * The subscriber of the running command went away: ask the server to stop it now. Waiting for the next bytes to arrive
+     * (as the flag alone does) means a long statement is only cancelled once it has finished anyway. While bytes are being
+     * processed the request waits until they are read, in case they already hold the end of the command.
+     */
+    private function requestCancel()
+    {
+        $this->cancelRequested = true;
+
+        if (!$this->handlingData) {
+            $this->cancelRequest();
+        }
+    }
+
     private function cancelRequest()
     {
         $this->cancelRequested = false;
@@ -908,7 +995,7 @@ class Connection extends EventEmitter
             $this->debug("Not canceling because there is nothing to cancel.");
             return;
         }
-        if ($this->currentCommand !== null) {
+        if ($this->currentCommand !== null && $this->backendKeyData !== null) {
             $this->cancelPending = true;
             $this->socket->connect($this->uri)->then(function (DuplexStreamInterface $conn) {
                 $cancelRequest = new CancelRequest($this->backendKeyData->getPid(), $this->backendKeyData->getKey());

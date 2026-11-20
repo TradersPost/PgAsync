@@ -30,6 +30,7 @@ class CommandComplete implements ParserInterface
                 case 'MOVE':
                 case 'FETCH':
                 case 'COPY':
+                case 'MERGE':
                     $this->rows = (int) $parts[1];
                     break;
             }
