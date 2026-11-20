@@ -36,6 +36,20 @@ final class Transaction
         return $this->connection->query($queryString);
     }
 
+    /**
+     * @see Connection::executeCommand()
+     *
+     * @return Observable<int>
+     */
+    public function executeCommand(string $queryString, array $parameters = []): Observable
+    {
+        if ($this->finished) {
+            return $this->inactiveError();
+        }
+
+        return $this->connection->executeCommand($queryString, $parameters);
+    }
+
     public function executeStatement(string $queryString, array $parameters = []): Observable
     {
         if ($this->finished) {

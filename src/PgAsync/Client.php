@@ -105,6 +105,24 @@ class Client
         );
     }
 
+    /**
+     * Runs a statement on a pooled connection and emits the number of rows its command tag reports once it is complete.
+     *
+     * @see Connection::executeCommand()
+     *
+     * @return Observable<int>
+     */
+    public function executeCommand(string $queryString, array $parameters = [])
+    {
+        return Observable::defer(function () use ($queryString, $parameters) {
+            return $this->connectionPool->acquire(false)->flatMap(function (Connection $conn) use ($queryString, $parameters) {
+                return $conn->executeCommand($queryString, $parameters)->do(function () use ($conn) {
+                    $this->connectionPool->release($conn);
+                });
+            });
+        });
+    }
+
     public function executeStatement(string $queryString, array $parameters = [])
     {
         return Observable::defer(function () use ($queryString, $parameters) {

@@ -90,6 +90,9 @@ class Connection extends EventEmitter
     const TLS_MODE_LIST_FULL = [self::TLS_MODE_DISABLE, self::TLS_MODE_ALLOW, self::TLS_MODE_PREFER, self::TLS_MODE_REQUIRE, self::TLS_MODE_VERIFY_CA, self::TLS_MODE_VERIFY_FULL];
     const TLS_MODE_LIST_REQUIRED = [self::TLS_MODE_REQUIRE, self::TLS_MODE_VERIFY_CA, self::TLS_MODE_VERIFY_FULL];
 
+    /** @var int rows the last finished command reported in its command tag (INSERT, UPDATE, DELETE, SELECT) */
+    private $lastRowsAffected = 0;
+
     private $queryState;
     private $queryType;
     private $connStatus;
@@ -563,6 +566,8 @@ class Connection extends EventEmitter
 
     private function handleCommandComplete(CommandComplete $message)
     {
+        $this->lastRowsAffected = $message->getRows();
+
         if ($this->currentCommand instanceof CommandInterface) {
             $command = $this->currentCommand;
             $this->currentCommand = null;
@@ -756,6 +761,21 @@ class Connection extends EventEmitter
             }
         );
 
+    }
+
+    /**
+     * Runs a statement and emits one value, the number of rows its command tag reports (rows changed by an INSERT, UPDATE or
+     * DELETE), once the statement is complete. Rows it returns are discarded.
+     *
+     * @return Observable<int>
+     */
+    public function executeCommand(string $queryString, array $parameters = []): Observable
+    {
+        return $this->executeStatement($queryString, $parameters)
+            ->toArray()
+            ->map(function () {
+                return $this->lastRowsAffected;
+            });
     }
 
     public function executeStatement(string $queryString, array $parameters = []): Observable
