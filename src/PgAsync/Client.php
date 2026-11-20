@@ -3,6 +3,7 @@
 namespace PgAsync;
 
 use PgAsync\Message\NotificationResponse;
+use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
 use React\Socket\ConnectorInterface;
 use Rx\Observable;
@@ -25,7 +26,8 @@ class Client
 
     public function __construct(array $parameters, ?LoopInterface $loop = null, ?ConnectorInterface $connector = null)
     {
-        $this->loop = $loop ?: \EventLoop\getLoop();
+        // React's own loop, not voryx/event-loop's: its getLoop() also registers a shutdown function that runs the loop when nobody did.
+        $this->loop = $loop ?? Loop::get();
 
         $autoDisconnect = false;
         $maxConnections = 5;

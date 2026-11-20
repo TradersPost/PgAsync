@@ -1,3 +1,9 @@
+# 2.7.0
+
+### Changes
+
+- `Client` takes React's own loop (`React\EventLoop\Loop::get()`) when no loop is passed, instead of `voryx/event-loop`'s `getLoop()`. It is the same loop, but `getLoop()` also registers a shutdown function that runs the loop when nobody did, which a long-running server or a command does not want. Code that passes a loop is unaffected.
+
 # 2.6.0
 
 ### Bug Fixes
